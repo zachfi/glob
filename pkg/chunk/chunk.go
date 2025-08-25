@@ -27,6 +27,7 @@ var _ Chunker = (*chunker)(nil)
 
 type chunker struct {
 	width int64
+	// TODO: implement a temporary directory for merge to write into.  Atomically merge the file into place.
 }
 
 func NewChunker(width int64) Chunker {
