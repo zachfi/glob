@@ -13,39 +13,50 @@ import (
 // TODO: write a test which is not even chunk widths
 func TestChunker(t *testing.T) {
 	cases := []struct {
+		name   string
 		width  int64
 		chunks int64
+		size   int64
 	}{
 		{
+			name:   "basic defaults",
 			width:  DefaultChunkSize,
 			chunks: 10,
+			size:   1024 * 1024 * 10,
+		},
+		{
+			name:   "basic with extra bytes",
+			width:  DefaultChunkSize,
+			chunks: 11,
+			size:   (1024 * 1024 * 10) + 32,
 		},
 	}
 
 	for _, tc := range cases {
-		tmpDir := t.TempDir()
-		path, hash := prepareTempFile(t, tmpDir, tc.width*tc.chunks)
+		t.Run(tc.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			path, hash := prepareTempFile(t, tmpDir, tc.size)
 
-		c := NewChunker(tc.width)
-		m, err := c.Meta(path)
-		require.NoError(t, err)
-
-		require.Equal(t, hash, m.Hash)
-		require.Len(t, m.Hashes, int(tc.chunks))
-
-		for i, h := range m.Hashes {
-
-			require.Len(t, h, 64)
-
-			var hash [64]byte
-			copy(hash[:], h)
-
-			d, err := c.Data(path, hash, int64(i))
+			c := NewChunker(tc.width)
+			m, err := c.Meta(path)
 			require.NoError(t, err)
 
-			require.Len(t, d, int(tc.width))
-		}
+			require.Equal(t, hash, m.Hash)
+			require.Len(t, m.Hashes, int(tc.chunks))
 
+			for i, h := range m.Hashes {
+
+				require.Len(t, h, 64)
+
+				var hash [64]byte
+				copy(hash[:], h)
+
+				d, err := c.Data(path, hash, int64(i))
+				require.NoError(t, err)
+
+				require.Len(t, d, int(tc.width))
+			}
+		})
 	}
 }
 
