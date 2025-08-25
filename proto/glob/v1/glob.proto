@@ -1,0 +1,112 @@
+syntax = "proto3";
+
+package glob.v1;
+
+// Object is the path, hashes, and data of an object.
+message Object {
+  // ObjectStatus is the path and hashes of an object.
+  ObjectStatus object_status = 1;
+
+  // Data is a slice of byte slices which correspond to the hash of the status at the same index.
+  repeated bytes data = 3;
+}
+
+// ObjectStatus is the path and hashes of an object.
+message ObjectStatus {
+  // Path is the filesystem target object
+  string path = 1;
+
+  // Hash is a slice of hashes for the given path.
+  repeated bytes hash = 2;
+}
+
+// Target is the directory on disk to replicate.
+message Target {
+  string name = 1;
+  bytes id = 2;
+  string last_update_time = 3;
+  repeated Object object = 4;
+}
+
+message TargetStatus {
+  bytes id = 1;
+  string last_update_time = 2;
+  repeated ObjectStatus object_status = 3;
+}
+
+// Replica is a peer host with which to sync data
+message Replica {
+  bytes id = 1;
+  bytes address = 2;
+  bool read_only = 3;
+}
+
+// ObjectNotification is a notification of an object change.
+message ObjectNotification {
+  bytes target_id = 1;
+  string path = 2;
+  ObjectOp op = 3;
+}
+
+// HashNotification is a notification of an object hash change.
+message HashNotification {
+  bytes target_id = 1;
+  string path = 2;
+  ChunkMeta chunk_meta = 3;
+}
+
+// ChunkMeta is the chunk metadata for an object.
+message ChunkMeta {
+  int64 byte_width = 1;
+  repeated bytes hashes = 2;
+  int64 total_bytes = 3;
+  bytes hash = 4;
+}
+
+// ChunkData is the chunk data for an individual chunk of an object.
+message ChunkData {
+  bytes hash = 1;
+  bytes data = 2;
+}
+
+message FetchChunksRequest {
+  bytes target_id = 1;
+  repeated Object object = 2;
+}
+
+message FetchChunksResponse {
+  bytes target_id = 1;
+  repeated Object object = 2;
+}
+
+message GetTargetStatusRequest {
+  bytes target_id = 1;
+}
+
+message GetTargetStatusResponse {
+  TargetStatus target_status = 2;
+}
+
+message SubscribeRequest {
+  bytes target_id = 1;
+}
+
+message SubscribeResponse {
+  bytes target_id = 1;
+  string path = 2; // relative to the target root
+  ObjectOp op = 3;
+}
+
+enum ObjectOp {
+  OBJECT_OP_UNSPECIFIED = 0;
+  OBJECT_OP_ADD = 1;
+  OBJECT_OP_REMOVE = 2;
+  OBJECT_OP_CHANGE = 3;
+  OBJECT_OP_RENAME = 4;
+}
+
+service SyncService {
+  rpc GetTargetStatus(GetTargetStatusRequest) returns (GetTargetStatusResponse);
+  rpc FetchChunks(FetchChunksRequest) returns (FetchChunksResponse);
+  rpc Subscribe(SubscribeRequest) returns(stream SubscribeResponse);
+}
