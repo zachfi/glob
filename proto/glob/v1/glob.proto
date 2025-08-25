@@ -105,6 +105,18 @@ enum ObjectOp {
   OBJECT_OP_RENAME = 4;
 }
 
+// TODO: There seems perhaps two kinds of scubscriptions we might want to make:
+// 1. Local object change notifications.  These would include the target, the
+// path, and the chunk hashes which have neen chagned.  As those chunks get
+// distributed to peers, perhaps each peer can let other peers know that they
+// have the chunks. 2. Peer hash chunks.  A peer is in the middle of pulling
+// data from another peer, and completes a chunk.  It should be able to notify
+// other peers that it has the chunk, so that they can pull from it.
+
+// TODO :peers also need to be able to ask other peers for the chunks that they
+// have, since if the above subscription was lost, or the peer was down whtn
+// the notication was sent, we might want to start from a clean state.
+
 service SyncService {
   rpc GetTargetStatus(GetTargetStatusRequest) returns (GetTargetStatusResponse);
   rpc FetchChunks(FetchChunksRequest) returns (FetchChunksResponse);
