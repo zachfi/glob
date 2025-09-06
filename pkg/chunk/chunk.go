@@ -3,11 +3,14 @@ package chunk
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"crypto/sha512"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	globv1proto "github.com/zachfi/glob/proto/glob/v1"
 )
@@ -16,28 +19,38 @@ const DefaultChunkSize = 1024 * 1024 // 1MB
 
 // Chunker should be able to return a chunk meta of an object, which includes the indivulal chunk hashes, the overall hash, and the total size of the object.  Chunker should also be able to read an individual chunk by its hash.
 type Chunker interface {
-	Meta(path string) (*globv1proto.ChunkMeta, error)
+	Meta(path string) (*ChunkMeta, error)
 	// TODO: are we using the hash to error if it doesn't match the data read?
-	Data(path string, hash [64]byte, index int64) ([]byte, error)
-
-	Merge(path string, hash [64]byte, data io.Reader) error
+	Data(path string, hash Hash, index int64) ([]byte, error)
+	Merge(ctx context.Context, path string, hash Hash, totalChunks int64, ch <-chan ChunkData) error
 }
 
 var _ Chunker = (*chunker)(nil)
 
 type chunker struct {
-	width int64
-	// TODO: implement a temporary directory for merge to write into.  Atomically merge the file into place.
+	width   int64
+	baseDir string
 }
 
-func NewChunker(width int64) Chunker {
-	return &chunker{
-		width: width,
+func NewChunker(width int64, baseDir string) (Chunker, error) {
+	if !filepath.IsAbs(baseDir) {
+		return nil, ErrAbsolutePathRequired
 	}
+
+	return &chunker{
+		width:   width,
+		baseDir: baseDir,
+	}, nil
 }
 
-func (c *chunker) Meta(path string) (*globv1proto.ChunkMeta, error) {
-	file, err := os.Open(path)
+func (c *chunker) Meta(path string) (meta *ChunkMeta, err error) {
+	if filepath.IsAbs(path) {
+		return nil, ErrRelativePathRequired
+	}
+
+	p := filepath.Join(c.baseDir, path)
+
+	file, err := os.Open(p)
 	if err != nil {
 		return nil, err
 	}
@@ -50,24 +63,25 @@ func (c *chunker) Meta(path string) (*globv1proto.ChunkMeta, error) {
 		return nil, err
 	}
 
-	return &globv1proto.ChunkMeta{
+	return meta.FromProto(&globv1proto.ChunkMeta{
 		TotalBytes: size,
-		Hashes:     hashes,
-		Hash:       hash,
+		Hashes:     hashes.Bytes(),
+		Hash:       hash.Bytes(),
 		ByteWidth:  DefaultChunkSize,
-	}, nil
+	}), nil
 }
 
 // chunkIt returns a slice of []byte representing list of hahes, the sum total hash
-func (c *chunker) chunkIt(reader *bufio.Reader) (hashes [][]byte, hash []byte, size int64, err error) {
-	var (
-		chunk       = make([]byte, c.width)
-		hasher      = sha512.New()
-		totalHasher = sha512.New()
-		bytesRead   int
-	)
+func (c *chunker) chunkIt(reader *bufio.Reader) (hashes Hashes, hash Hash, size int64, err error) {
+	totalHasher := sha512.New()
 
 	for {
+		var (
+			chunk     = make([]byte, c.width)
+			hasher    = sha512.New()
+			bytesRead int
+		)
+
 		bytesRead, err = io.ReadFull(reader, chunk)
 
 		// We always process whatever we read, even if it's less than a full chunk.
@@ -76,7 +90,14 @@ func (c *chunker) chunkIt(reader *bufio.Reader) (hashes [][]byte, hash []byte, s
 		size += int64(bytesRead)
 
 		if bytesRead > 0 {
-			hashes = append(hashes, hasher.Sum(nil))
+
+			var h Hash
+			err = h.FromBytes(hasher.Sum(nil))
+			if err != nil {
+				return nil, Hash{}, 0, err
+			}
+
+			hashes = append(hashes, h)
 			hasher.Reset()
 		}
 
@@ -84,15 +105,27 @@ func (c *chunker) chunkIt(reader *bufio.Reader) (hashes [][]byte, hash []byte, s
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				break
 			}
-			return nil, nil, 0, err
+			return nil, Hash{}, 0, err
 		}
 	}
 
-	return hashes, totalHasher.Sum(nil), size, nil
+	var totalHash Hash
+	err = totalHash.FromBytes(totalHasher.Sum(nil))
+	if err != nil {
+		return nil, Hash{}, 0, err
+	}
+
+	return hashes, totalHash, size, nil
 }
 
-func (c *chunker) Data(path string, hash [64]byte, index int64) ([]byte, error) {
-	f, err := os.Open(path)
+func (c *chunker) Data(path string, hash Hash, index int64) ([]byte, error) {
+	if filepath.IsAbs(path) {
+		return nil, ErrRelativePathRequired
+	}
+
+	p := filepath.Join(c.baseDir, path)
+
+	f, err := os.Open(p)
 	if err != nil {
 		return nil, err
 	}
@@ -107,14 +140,65 @@ func (c *chunker) Data(path string, hash [64]byte, index int64) ([]byte, error) 
 	}
 
 	// Hash only the bytes read
-	dataHash := sha512.Sum512(data[:i])
-	if hash != dataHash {
+	var dataHash Hash = sha512.Sum512(data[:i])
+
+	if !bytes.Equal(hash.Bytes(), dataHash.Bytes()) {
 		return nil, ErrChecksumNotMatched
 	}
 
-	return data, nil
+	// Return only the bytes read
+	return data[:i], nil
 }
 
-func (c *chunker) Merge(path string, hash [64]byte, reader io.Reader) error {
-	return nil
+func (c *chunker) Merge(ctx context.Context, path string, totalHash Hash, totalChunks int64, chunks <-chan ChunkData) error {
+	if filepath.IsAbs(path) {
+		return ErrRelativePathRequired
+	}
+
+	p := filepath.Join(c.baseDir, path)
+
+	tempFile, err := os.CreateTemp(c.baseDir, "glob-merge-*")
+	if err != nil {
+		return err
+	}
+	// Defer removal of the temporary file in case of an error
+	// before the atomic rename.
+	defer func() {
+		_ = tempFile.Close()
+		_ = os.Remove(tempFile.Name())
+	}()
+
+	var chunkReader io.Reader
+
+	finalHasher := sha512.New()
+
+	for range totalChunks {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case chunk := <-chunks:
+			offset := chunk.index * c.width
+			_, err = tempFile.WriteAt(chunk.Data, offset)
+			if err != nil {
+				return fmt.Errorf("failed to write chunk to temp file: %w", err)
+			}
+
+			chunkReader = bytes.NewReader(chunk.Data)
+			if _, err = io.Copy(finalHasher, chunkReader); err != nil {
+				return err
+			}
+		}
+	}
+
+	finalHash := finalHasher.Sum(nil)
+
+	if !bytes.Equal(finalHash, totalHash.Bytes()) {
+		return ErrChecksumNotMatched
+	}
+
+	if err := tempFile.Close(); err != nil {
+		return err
+	}
+
+	return os.Rename(tempFile.Name(), p)
 }

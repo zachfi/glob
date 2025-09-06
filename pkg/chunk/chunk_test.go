@@ -1,16 +1,21 @@
 package chunk
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha512"
+	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
+	globv1 "github.com/zachfi/glob/proto/glob/v1"
 )
 
-// TODO: write a test which is not even chunk widths
 func TestChunker(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -35,32 +40,69 @@ func TestChunker(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			tmpDir := t.TempDir()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
 			path, hash := prepareTempFile(t, tmpDir, tc.size)
 
-			c := NewChunker(tc.width)
-			m, err := c.Meta(path)
+			c, err := NewChunker(tc.width, tmpDir)
 			require.NoError(t, err)
 
-			require.Equal(t, hash, m.Hash)
+			tmpFilePath := filepath.Base(path)
+
+			m, err := c.Meta(tmpFilePath)
+			require.NoError(t, err)
+
+			require.Equal(t, hash.Bytes(), m.Hash)
 			require.Len(t, m.Hashes, int(tc.chunks))
 
+			data := make([][]byte, len(m.Hashes))
+
 			for i, h := range m.Hashes {
-
-				require.Len(t, h, 64)
-
-				var hash [64]byte
-				copy(hash[:], h)
-
-				d, err := c.Data(path, hash, int64(i))
+				var hash Hash
+				err = hash.FromBytes(h)
 				require.NoError(t, err)
 
-				require.Len(t, d, int(tc.width))
+				d, err := c.Data(tmpFilePath, hash, int64(i))
+				require.NoError(t, err)
+				data[i] = d
 			}
+
+			ch := make(chan ChunkData)
+			defer close(ch)
+
+			bg := sync.WaitGroup{}
+
+			bg.Add(1)
+			go func() {
+				defer bg.Done()
+				err := c.Merge(ctx, "file.bin", m.hash, int64(len(m.Hashes)), ch)
+				require.NoError(t, err)
+			}()
+
+			bg.Add(1)
+			go func() {
+				defer bg.Done()
+				for i := range data {
+					select {
+					case <-ctx.Done():
+						return
+					case ch <- ChunkData{
+						index: int64(i),
+						ChunkData: &globv1.ChunkData{
+							Hash: m.Hashes[i],
+							Data: data[i],
+						},
+					}:
+					}
+				}
+			}()
+
+			bg.Wait()
 		})
 	}
 }
 
-func prepareTempFile(t *testing.T, dir string, size int64) (path string, hash []byte) {
+func prepareTempFile(t *testing.T, dir string, size int64) (path string, hash Hash) {
 	f, err := os.CreateTemp(dir, "chunk")
 	require.NoError(t, err)
 
@@ -76,26 +118,26 @@ func prepareTempFile(t *testing.T, dir string, size int64) (path string, hash []
 	err = f.Close()
 	require.NoError(t, err)
 
-	// Checksum the file we just wrote.
-	ff, err := os.Open(f.Name())
-	require.NoError(t, err)
-	defer func() { _ = ff.Close() }()
-
-	hasher := sha512.New()
-	_, err = io.Copy(hasher, ff)
-	require.NoError(t, err)
-
-	return f.Name(), hasher.Sum(nil)
+	return f.Name(), hashFile(t, f.Name())
 }
 
-func hashFile(t *testing.T, path string) []byte {
+func hashFile(t *testing.T, path string) Hash {
 	f, err := os.Open(path)
 	require.NoError(t, err)
-	defer func() { _ = f.Close() }()
+	defer func() {
+		funcErr := f.Close()
+		require.NoError(t, funcErr)
+	}()
 
 	hasher := sha512.New()
 	_, err = io.Copy(hasher, f)
 	require.NoError(t, err)
 
-	return hasher.Sum(nil)
+	var dataHash Hash
+	err = dataHash.FromBytes(hasher.Sum(nil))
+	require.NoError(t, err)
+
+	fmt.Printf("hashFile.dataHash: %+v\n", dataHash)
+
+	return dataHash
 }
